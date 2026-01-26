@@ -1,0 +1,61 @@
+* Developers:
+Pascal Obry
+Victor Forsiuk
+Hanno Schwalm
+Mario Zimmermann
+Ralf Brown
+Roman Lebedev
+Kofa
+Diederik ter Rahe
+Jeronimo Pellegrini
+Martin Straeten
+Bill Ferguson
+Miloš Komarčević
+Vladimir Tyrtov
+EdgarLux
+Marko Vertainen
+Matjaž Jeran
+Jonas Schäfer
+Hwanyong Lee
+bajdero
+
+* Translators:
+Victor Forsiuk
+Pascal Obry
+Jeronimo Pellegrini
+Martin Straeten
+EdgarLux
+Marko Vertainen
+Matjaž Jeran
+Hwanyong Lee
+bajdero
+Besmir Godolja
+Elia Devito
+Kang-Wei Hsu
+Яна Тунгушпаева
+Báthory Péter
+Jan Šmucr
+Johan Schiff
+Reinder Mulder
+Ryo Shinozaki
+Tianhao Chai
+
+* Sub-module rawspeed contributors (at least 1 commit):
+Miloš Komarčević
+Roman Lebedev
+Jonas Schäfer
+
+* Sub-module integration contributors (at least 1 commit):
+Pascal Obry
+ralfbrown
+
+* Sub-module lua-scripts contributors (at least 1 commit):
+wpferguson
+Bill Ferguson
+Michael Reiger
+Tasos Bakogiannis
+deekayhd
+Balázs Dura-Kovács
+sjjh
+
+And all those of you that made previous releases possible
