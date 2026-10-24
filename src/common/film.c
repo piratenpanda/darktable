@@ -524,6 +524,78 @@ GList *dt_film_get_image_ids(const dt_filmid_t filmid)
   return g_list_reverse(result);  // list was built in reverse order, so un-reverse it
 }
 
+static gint64 _folder_check_timeout_us(void)
+{
+  return dt_conf_get_int("storage/folder_check_timeout") * G_TIME_SPAN_MILLISECOND;
+}
+
+// availability check of one film roll folder, run on a pool thread so that
+// a folder on an unresponsive mount (e.g. hard-mounted NFS) cannot block the caller.
+// shared between the caller and the pool thread, freed when refs drops to 0.
+typedef struct dt_film_folder_check_t
+{
+  gchar *folder;
+  gboolean done;
+  gboolean is_dir;
+  int refs;
+} dt_film_folder_check_t;
+
+typedef struct dt_film_folder_item_t
+{
+  int filmid;
+  dt_film_folder_check_t *check;
+} dt_film_folder_item_t;
+
+static GMutex _folder_check_mutex;
+static GCond _folder_check_cond;
+static GThreadPool *_folder_check_pool = NULL;
+// folders whose check has not completed yet, keyed by folder, not owning the checks
+static GHashTable *_folder_check_pending = NULL;
+
+static void _folder_check_unref_locked(dt_film_folder_check_t *check)
+{
+  if(--check->refs == 0)
+  {
+    g_free(check->folder);
+    g_free(check);
+  }
+}
+
+static void _folder_check_run(gpointer data, gpointer user_data)
+{
+  dt_film_folder_check_t *check = data;
+  const gboolean is_dir = g_file_test(check->folder, G_FILE_TEST_IS_DIR);
+
+  g_mutex_lock(&_folder_check_mutex);
+  check->is_dir = is_dir;
+  check->done = TRUE;
+  g_hash_table_remove(_folder_check_pending, check->folder);
+  _folder_check_unref_locked(check);
+  g_cond_broadcast(&_folder_check_cond);
+  g_mutex_unlock(&_folder_check_mutex);
+}
+
+static void _folder_check_init_locked(void)
+{
+  if(!_folder_check_pending)
+  {
+    _folder_check_pending = g_hash_table_new(g_str_hash, g_str_equal);
+    // unlimited threads: threads stuck on an unresponsive mount must not
+    // starve the checks of other folders
+    _folder_check_pool = g_thread_pool_new(_folder_check_run, NULL, -1, FALSE, NULL);
+  }
+}
+
+static dt_film_folder_check_t *_folder_check_start_locked(const char *folder)
+{
+  dt_film_folder_check_t *check = g_new0(dt_film_folder_check_t, 1);
+  check->folder = g_strdup(folder);
+  check->refs = 2;
+  g_hash_table_insert(_folder_check_pending, check->folder, check);
+  g_thread_pool_push(_folder_check_pool, check, NULL);
+  return check;
+}
+
 void dt_film_set_folder_status()
 {
   sqlite3_stmt *stmt, *stmt2;
@@ -544,18 +616,104 @@ void dt_film_set_folder_status()
                               -1, &stmt2, NULL);
   // clang-format on
 
+  g_mutex_lock(&_folder_check_mutex);
+  _folder_check_init_locked();
+
+  // folders whose previous check is still blocked are reported as unavailable
+  // and not checked again, so at most one thread is stuck per folder
+  GArray *items = g_array_new(FALSE, FALSE, sizeof(dt_film_folder_item_t));
   while(sqlite3_step(stmt) == SQLITE_ROW)
   {
-    const int filmid = sqlite3_column_int(stmt, 0);
     const char *folder = (char *)sqlite3_column_text(stmt, 1);
-    const int status = g_file_test(folder, G_FILE_TEST_IS_DIR);
-    DT_DEBUG_SQLITE3_BIND_INT(stmt2, 1, filmid);
+    dt_film_folder_item_t item = { .filmid = sqlite3_column_int(stmt, 0), .check = NULL };
+    if(folder && !g_hash_table_contains(_folder_check_pending, folder))
+      item.check = _folder_check_start_locked(folder);
+    g_array_append_val(items, item);
+  }
+  sqlite3_finalize(stmt);
+
+  const gint64 end_time = g_get_monotonic_time() + _folder_check_timeout_us();
+  for(guint i = 0; i < items->len; i++)
+  {
+    const dt_film_folder_check_t *check = g_array_index(items, dt_film_folder_item_t, i).check;
+    while(check && !check->done)
+      if(!g_cond_wait_until(&_folder_check_cond, &_folder_check_mutex, end_time))
+        break;
+  }
+
+  for(guint i = 0; i < items->len; i++)
+  {
+    dt_film_folder_item_t *item = &g_array_index(items, dt_film_folder_item_t, i);
+    const int status = item->check && item->check->done && item->check->is_dir;
+    if(item->check && !item->check->done)
+      dt_print(DT_DEBUG_ALWAYS, "[film] folder '%s' did not respond, marked as unavailable",
+               item->check->folder);
+    if(item->check) _folder_check_unref_locked(item->check);
+    DT_DEBUG_SQLITE3_BIND_INT(stmt2, 1, item->filmid);
     DT_DEBUG_SQLITE3_BIND_INT(stmt2, 2, status);
     sqlite3_step(stmt2);
     sqlite3_reset(stmt2);
   }
-  sqlite3_finalize(stmt);
+  g_mutex_unlock(&_folder_check_mutex);
+
+  g_array_free(items, TRUE);
   sqlite3_finalize(stmt2);
+}
+
+gboolean dt_film_check_folder_available(const dt_filmid_t id)
+{
+  gchar *folder = dt_film_get_folder(id);
+  if(!folder) return FALSE;
+
+  g_mutex_lock(&_folder_check_mutex);
+  _folder_check_init_locked();
+
+  // a check still blocked from an earlier call is waited for instead of
+  // starting another one, it completes once the mount responds again
+  dt_film_folder_check_t *check = g_hash_table_lookup(_folder_check_pending, folder);
+  if(check)
+    check->refs++;
+  else
+    check = _folder_check_start_locked(folder);
+
+  const gint64 end_time = g_get_monotonic_time() + _folder_check_timeout_us();
+  while(!check->done)
+    if(!g_cond_wait_until(&_folder_check_cond, &_folder_check_mutex, end_time))
+      break;
+
+  const gboolean available = check->done && check->is_dir;
+  if(!check->done)
+    dt_print(DT_DEBUG_ALWAYS, "[film] folder '%s' did not respond, marked as unavailable", folder);
+  _folder_check_unref_locked(check);
+  g_mutex_unlock(&_folder_check_mutex);
+  g_free(folder);
+
+  sqlite3_stmt *stmt;
+  DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db),
+                              "INSERT OR REPLACE INTO memory.film_folder (id, status) "
+                              "VALUES (?1, ?2)",
+                              -1, &stmt, NULL);
+  DT_DEBUG_SQLITE3_BIND_INT(stmt, 1, id);
+  DT_DEBUG_SQLITE3_BIND_INT(stmt, 2, available);
+  sqlite3_step(stmt);
+  sqlite3_finalize(stmt);
+
+  return available;
+}
+
+gboolean dt_film_is_folder_available(const dt_filmid_t id)
+{
+  // folders without an entry in memory.film_folder are reported as available
+  gboolean available = TRUE;
+  sqlite3_stmt *stmt;
+  DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db),
+                              "SELECT status FROM memory.film_folder WHERE id = ?1",
+                              -1, &stmt, NULL);
+  DT_DEBUG_SQLITE3_BIND_INT(stmt, 1, id);
+  if(sqlite3_step(stmt) == SQLITE_ROW)
+    available = sqlite3_column_int(stmt, 0) != 0;
+  sqlite3_finalize(stmt);
+  return available;
 }
 
 gchar *dt_film_get_folder(const dt_filmid_t id)
